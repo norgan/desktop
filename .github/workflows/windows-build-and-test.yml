@@ -4,6 +4,9 @@ name: Windows Build and Test
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, closed]
+  push:
+    branches: [integration/discovery-progress-batching-win-test-20261018]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -11,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    if: ${{ github.event.action != 'closed' && !github.event.pull_request.draft }}
+    if: ${{ github.event_name != 'pull_request' || (github.event.action != 'closed' && !github.event.pull_request.draft) }}
     name: Windows Build and Test
     runs-on: windows-2022
     env:
@@ -138,6 +141,46 @@ jobs:
               $binFolder = "$buildFolder\bin"
 
               & ctest --output-on-failure --timeout 300
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           
           runTests
+
+      - name: Package unsigned Windows test installer
+        shell: pwsh
+        run: |
+          $craftMaster = Join-Path $env:CRAFT_MASTER_LOCATION "CraftMaster.py"
+          python $craftMaster --config $env:CRAFT_MASTER_CONFIG --target $env:CRAFT_TARGET -c --src-dir $env:GITHUB_WORKSPACE --package nextcloud-client
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Craft packages to CraftRoot\tmp. A build-tree EXE lacks Qt/runtime dependencies.
+          $packageRoot = Join-Path (Join-Path $env:GITHUB_WORKSPACE $env:CRAFT_TARGET) "tmp"
+          if (!(Test-Path -LiteralPath $packageRoot)) {
+              throw "Craft package output directory does not exist: $packageRoot"
+          }
+          $packages = @(Get-ChildItem -LiteralPath $packageRoot -File -Recurse -Filter "*.exe" |
+              Where-Object { $_.Name -match "nextcloud" -and $_.Length -gt 5MB } |
+              Sort-Object LastWriteTimeUtc -Descending)
+          if ($packages.Count -lt 1) {
+              throw "No Nextcloud installer executable found under $packageRoot"
+          }
+
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE "windows-test-artifact"
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          $shortSha = $env:GITHUB_SHA.Substring(0, 12)
+          $installerName = "nextcloud-discovery-test-$shortSha-unsigned.exe"
+          $installerPath = Join-Path $artifactDir $installerName
+          Copy-Item -LiteralPath $packages[0].FullName -Destination $installerPath -Force
+          $hash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$installerName" | Set-Content -LiteralPath (Join-Path $artifactDir "SHA256SUMS.txt") -Encoding ascii
+          "UNSIGNED, EXPERIMENTAL BUILD. Test only with an isolated Nextcloud account and sync directory." |
+              Set-Content -LiteralPath (Join-Path $artifactDir "READ-ME-FIRST.txt") -Encoding utf8
+          Write-Host "Packaged $installerName (SHA256: $hash)"
+
+      - name: Upload unsigned Windows test installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextcloud-discovery-windows-${{ github.sha }}
+          path: windows-test-artifact/*
+          if-no-files-found: error
+          retention-days: 14
